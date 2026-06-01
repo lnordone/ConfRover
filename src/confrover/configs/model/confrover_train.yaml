@@ -1,0 +1,139 @@
+# @package _global_
+#
+# Trainable ConfRover model config.
+#
+# Identical to confrover.yaml except:
+#   1. _target_ points at ConfRoverTrainable (adds training_step etc.).
+#   2. decoder.loss is instantiated (the upstream config leaves it null).
+#   3. Optimizer/scheduler hyperparameters are exposed at the top level.
+
+_target_: confrover.train.module.ConfRoverTrainable
+
+seed: 42
+use_deepspeed_evo_attention: false
+kv_cache_type: offloaded
+
+# Diffusion-time sampling range used by training_step.
+t_min: 0.01
+t_max: 1.0
+
+optimizer_cfg:
+  lr: 1.0e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+
+scheduler_cfg:
+  warmup_steps: 1000
+  total_steps: 100000
+  min_lr_ratio: 0.1
+
+encoder:
+  _target_: confrover.model.encoder.pseudo_beta_pair.PseudoBetaPairEncoder
+  res_idx_emb_size: 128
+  output_size: ${..temporal.llama_config.hidden_size}
+  pretrained_single_dim: 384
+  pretrained_pair_dim: 128
+  use_trainable_mask_embedding: false
+  use_deepspeed_evo_attention: ${..use_deepspeed_evo_attention}
+  chunk_size: ${..temporal.pairformer_config.chunk_size}
+
+temporal:
+  _target_: confrover.model.temporal.llama.FusedLlamaPairformerModule
+
+  hidden_size: 128
+
+  llama_config:
+    _target_: transformers.models.llama.configuration_llama.LlamaConfig
+    hidden_size: ${..hidden_size}
+    intermediate_size: 256
+    num_hidden_layers: 8
+    num_attention_heads: 4
+    max_position_embeddings: 100005
+    use_cache: false
+    cache_type: ${...kv_cache_type}
+    attn_implementation: eager
+
+  pairformer_config:
+    no_blocks: 1
+    c_s: ${..hidden_size}
+    c_z: ${..hidden_size}
+    c_hidden_mul: 128
+    no_heads_tri_attn: 4
+    c_hidden_pair_attn: 32
+    no_heads_single_attn: 16
+    transition_n: 4
+    pair_dropout: 0.25
+    fuse_projection_weights: false
+    blocks_per_ckpt: 1
+    clear_cache_between_blocks: false
+    inf: 1.0e8
+    chunk_size: null
+    use_deepspeed_evo_attention: ${...use_deepspeed_evo_attention}
+
+decoder:
+  _target_: confrover.model.decoder.confdiff.ConfDiffDecoder
+  freeze_model_nn: false   # train end-to-end
+
+  # The upstream config does not include this; we populate it here.
+  loss:
+    _target_: confrover.train.loss.SE3DiffusionLoss
+    weights:
+      _target_: confrover.train.loss.LossWeights
+      rot: 1.0
+      trans: 1.0
+      bb_atom: 0.0       # TODO: set > 0 once you port loss_bb_atom
+      dist_mat: 0.0
+      torsion: 0.0
+      aux_atom14: 0.0
+    t_bb_threshold: 0.25
+
+  model_nn:
+    _target_: confrover.model.decoder.confdiff.ConfDiffNetwork
+    single_hidden_dim: ${...temporal.hidden_size}
+    pair_hidden_dim: ${...temporal.hidden_size}
+    embedder:
+      _target_: confrover.model.decoder.confdiff.embedder.Embedder
+      time_emb_size: 64
+      scale_t: 1000.0
+      res_idx_emb_size: 64
+      num_rbf: 64
+      rbf_min: 0.0
+      rbf_max: 5.0
+      pretrained_single_dim: 384
+      pretrained_pair_dim: 128
+      single_dim: 256
+      pair_dim: 128
+    structure_module:
+      _target_: confrover.model.decoder.confdiff.structure_module.StructureModule
+      num_ipa_blocks: 4
+      c_s: 256
+      c_z: 128
+      c_hidden: 256
+      c_skip: 64
+      no_heads: 4
+      no_qk_points: 8
+      no_v_points: 12
+      seq_tfmr_num_heads: 4
+      seq_tfmr_num_layers: 2
+      anglenet_hidden: 128
+      anglenet_no_blocks: 2
+
+  diffuser:
+    _target_: confrover.model.decoder.confdiff.diffuser.se3_diffuser.SE3Diffuser
+    se3_conf:
+      diffuse_trans: true
+      diffuse_rot: true
+      r3:
+        min_b: 0.1
+        max_b: 20.0
+        coordinate_scaling: 0.1
+        alpha: -1
+      so3:
+        num_omega: 1000
+        num_sigma: 1000
+        min_sigma: 0.1
+        max_sigma: 1.5
+        schedule: "logarithmic"
+        cache_dir: ".cache/"
+        use_cached_score: false
+        alpha: -1

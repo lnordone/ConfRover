@@ -1,0 +1,75 @@
+# @package _global_
+#
+# Top-level Hydra config for ConfRover training (community reproduction).
+#
+# Use with: python -m confrover.train.cli --train_manifest <path> --output_dir <path>
+#
+# All keys are intentionally overridable from the CLI.
+
+output_dir: ???
+seed: 42
+
+# Optional: load pretrained weights as a starting point (set to null to
+# train from scratch). Useful for continued pretraining or fine-tuning.
+from_pretrained_ckpt: null
+resume_ckpt: null  # full Lightning ckpt to resume optimizer + scheduler state
+
+data:
+  _target_: confrover.data.datamodule.ConfRoverDataModule
+  train_dataset:
+    _target_: confrover.train.dataset.TrajDataset
+    config: ???
+    deterministic: false
+    batch_size: 1
+    num_workers: 4
+    pin_memory: true
+    shuffle: true
+    repr_loader:
+      _target_: confrover.data.pretrain_repr.openfold.loader.OpenFoldReprLoader
+      repr_root: ???
+      num_recycles: 3
+      load_single: true
+      load_pair: true
+      v1: false
+  val_dataset: null
+
+trainer:
+  _target_: lightning.pytorch.trainer.Trainer
+  default_root_dir: ${output_dir}
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+  max_steps: 100000
+  log_every_n_steps: 10
+  val_check_interval: 1000
+  gradient_clip_val: 1.0
+  enable_checkpointing: true
+  enable_model_summary: true
+
+callbacks:
+  model_summary:
+    _target_: lightning.pytorch.callbacks.RichModelSummary
+    max_depth: 2
+  rich_progress_bar:
+    _target_: lightning.pytorch.callbacks.RichProgressBar
+    leave: true
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    dirpath: ${output_dir}/checkpoints
+    filename: "step{step:08d}-loss{train/loss:.4f}"
+    save_top_k: 3
+    monitor: train/loss
+    mode: min
+    save_last: true
+    auto_insert_metric_name: false
+
+# Default: TensorBoard. Swap for WandB by setting logger._target_ to
+# lightning.pytorch.loggers.WandbLogger.
+logger:
+  _target_: lightning.pytorch.loggers.TensorBoardLogger
+  save_dir: ${output_dir}
+  name: confrover_train
+  version: ""

@@ -1,0 +1,15 @@
+{
+  "name": "smoke",
+  "n_frames": 4,
+  "stride_in_10ps": 120,
+  "samples_per_epoch": null,
+  "cases": [
+    {
+      "case_id": "7jfl_C",
+      "seqres": "SALQDLLRTLKSPSSPQQQQQVLNILKSNPQLMAAFIKQRTAKYVAN",
+      "xtc_fpath": "tests/test_data/atlas/7jfl_C/7jfl_C_prod_R1_fit.xtc",
+      "pdb_fpath": "tests/test_data/atlas/7jfl_C/7jfl_C.pdb",
+      "n_total_frames": 100
+    }
+  ]
+}
