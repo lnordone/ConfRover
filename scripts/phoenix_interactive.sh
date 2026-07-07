@@ -11,8 +11,10 @@
 #   2. cd into the repo, then:
 #        bash scripts/phoenix_interactive.sh
 #
-# To override defaults inline, e.g.:
-#   QOS=inferno GPU_TYPE=H100 WALLTIME=01:00:00 bash scripts/phoenix_interactive.sh
+# Defaults target an L40S-capable account on the inferno (non-preemptible) queue.
+# Set SLURM_ACCOUNT to your own account (see below). Override anything inline, e.g.
+# grab an H100 on the free backfill queue instead:
+#   QOS=embers GPU_TYPE=H100 WALLTIME=01:00:00 bash scripts/phoenix_interactive.sh
 
 set -euo pipefail
 
@@ -24,15 +26,16 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-gts-yourPI}"
 
-# QOS: "embers" is backfill (free or near-free, can be preempted by inferno
-# jobs but rarely is for short windows). "inferno" is the paid regular queue.
-# Recommended for the smoke test: embers.
-QOS="${QOS:-embers}"
+# QOS: "inferno" is the regular/non-preemptible queue (charges the account).
+# "embers" is free backfill but CAN be preempted. For a short interactive smoke
+# test either is fine; inferno guarantees the node won't vanish mid-session.
+QOS="${QOS:-inferno}"
 
 # GPU type. Phoenix has (as of FY26): H200, H100, L40S, A100, RTX_6000.
-# H200/H100/L40S require RHEL9 nodes. Smoke test fits on any of these
-# (model is 20M params, seq len ~50). Default H100 because it's plentiful.
-GPU_TYPE="${GPU_TYPE:-H100}"
+# Default to L40S: if your account is L40S-earmarked this is required, and it is
+# more than enough for this 20M-param model (the pipeline is CPU/IO-bound anyway,
+# so a bigger GPU wouldn't speed it up). Change if your account uses another type.
+GPU_TYPE="${GPU_TYPE:-L40S}"
 NUM_GPUS="${NUM_GPUS:-1}"
 
 # Walltime, cores, memory. Defaults are sized for the overfit smoke test:

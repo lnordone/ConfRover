@@ -13,14 +13,15 @@
 # ============================================================================
 
 #SBATCH --job-name=confrover-train
-#SBATCH --account=gts-yourPI               # CHANGE: run `pace-quota` to find yours
-#SBATCH --qos=embers                       # embers (free/backfill) or inferno (paid)
+#SBATCH --account=gts-yourPI               # CHANGE: your L40S-capable account; `pace-quota` to list
+#SBATCH --qos=inferno                      # inferno = regular/non-preemptible (use for long runs);
+                                           # embers = free backfill but CAN be preempted mid-run
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:H100:1                  # H100 / H200 / L40S / A100 / RTX_6000
+#SBATCH --gres=gpu:L40S:1                  # this grant is L40S-earmarked; plenty for the 20M model
 #SBATCH --mem=64G
-#SBATCH --time=12:00:00                    # max 8 days on inferno; embers may be preempted
+#SBATCH --time=24:00:00                    # 100k steps fits well inside 24h; max 8 days on inferno
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 #SBATCH --mail-type=NONE                   # set to BEGIN,END,FAIL if you want emails
