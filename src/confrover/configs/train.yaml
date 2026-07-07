@@ -31,6 +31,10 @@ data:
       load_single: true
       load_pair: true
       v1: false
+  # Validation is off by default. Pass `--val_manifest <path>` and the CLI
+  # mirrors the train_dataset block above (deterministic, shuffle off) into a
+  # val_dataset, so `validation_step` runs and `val/loss` is logged at
+  # `trainer.val_check_interval`.
   val_dataset: null
 
 trainer:

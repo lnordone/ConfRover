@@ -106,6 +106,10 @@ filterwarnings = [
 # Show summary of skipped/xfail tests
 addopts = "-ra -n 4"
 
+markers = [
+  "slow: heavy tests (full model instantiation, GPU); deselect with -m 'not slow'",
+]
+
 testpaths = [
   "tests"
 ]

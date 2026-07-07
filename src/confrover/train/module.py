@@ -38,6 +38,7 @@ just trained in parallel across frames instead of sampled autoregressively.
 """
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, Tuple
 
 import torch
@@ -49,6 +50,27 @@ from confrover.utils import get_pylogger
 from confrover.utils.torch.tensor import rearrange
 
 logger = get_pylogger(__name__)
+
+
+def _to_inference_model_cfg(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a *trainable* model config into an inference-compatible one.
+
+    The upstream inference path (``ConfRover.from_pretrained`` /
+    ``inference.py``) instantiates ``confrover.model.confrover.ConfRover`` with
+    ``decoder.loss = None`` and no optimizer/scheduler. We rewrite the recorded
+    trainable config to match, so the ``model_cfg`` we embed in checkpoints is
+    exactly what those loaders expect. ``ConfRoverTrainable`` adds no new
+    parameters over ``ConfRover``, so the state_dict keys are identical and a
+    ``strict=True`` load succeeds.
+    """
+    cfg = copy.deepcopy(dict(model_cfg))
+    cfg["_target_"] = "confrover.model.confrover.ConfRover"
+    for k in ("optimizer_cfg", "scheduler_cfg", "t_min", "t_max"):
+        cfg.pop(k, None)
+    decoder = cfg.get("decoder")
+    if isinstance(decoder, dict):
+        decoder["loss"] = None
+    return cfg
 
 
 class ConfRoverTrainable(ConfRover):
@@ -104,6 +126,40 @@ class ConfRoverTrainable(ConfRover):
         }
         self.t_min = t_min
         self.t_max = t_max
+        # Resolved model config, recorded by the training CLI via
+        # :meth:`set_model_cfg` so checkpoints can embed it (see
+        # :meth:`on_save_checkpoint`).
+        self._model_cfg: Dict[str, Any] | None = None
+
+    # =========================================================================
+    # Checkpoint compatibility with the upstream inference loader
+    # =========================================================================
+
+    def set_model_cfg(self, model_cfg: Dict[str, Any]) -> None:
+        """Record the resolved model config used to build this model.
+
+        The training CLI calls this right after instantiation. It lets
+        :meth:`on_save_checkpoint` embed a ``model_cfg`` so trained checkpoints
+        load via ``ConfRover.from_pretrained`` / ``load_model_checkpoint``.
+        """
+        self._model_cfg = model_cfg
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Inject ``model_cfg`` into every saved checkpoint.
+
+        Lightning's ``ModelCheckpoint`` saves ``state_dict`` but not the model
+        config; the upstream inference path needs both. If no config was
+        recorded, we warn rather than fail so plain Lightning usage still works.
+        """
+        super().on_save_checkpoint(checkpoint)
+        if self._model_cfg is None:
+            logger.warning(
+                "on_save_checkpoint: no model_cfg recorded (call set_model_cfg "
+                "after instantiation); checkpoint will NOT be loadable via "
+                "ConfRover.from_pretrained."
+            )
+            return
+        checkpoint["model_cfg"] = _to_inference_model_cfg(self._model_cfg)
 
     # =========================================================================
     # Training step
@@ -235,23 +291,19 @@ class ConfRoverTrainable(ConfRover):
         s_out, z_out = self._split_single_pair(hidden_BFMC, seqlen=L)
         # s_out: (B*F, L, C); z_out: (B*F, L, L, C)
 
-        # ---- Step 6: sample diffusion times and noise rigids_0 -> rigids_t ----
-        # NOTE: diffuser.forward_marginal in this repo expects a scalar t. To
-        # batch per-example t we'd loop or vectorize; the smoke-test version
-        # samples a single t for the whole batch (acceptable -- gradient
-        # diversity comes from many steps, not many t's per step).
-        # TODO: port per-example t sampling from ConfDiff for production runs.
-        t_scalar = float(
-            torch.empty(1).uniform_(self.t_min, self.t_max).item()
-        )
-        t_vec = torch.full(
-            (BF,), t_scalar, dtype=s_out.dtype, device=s_out.device
+        # ---- Step 6: sample per-example diffusion times and noise rigids_0 ----
+        # Each of the B*F frames gets its own t ~ U[t_min, t_max]. A single
+        # optimizer step therefore sees a spread of noise levels, which matters
+        # for the backbone-atom loss (gated on low-t frames) and for gradient
+        # diversity at scale.
+        t_vec = torch.empty(BF, dtype=s_out.dtype, device=s_out.device).uniform_(
+            self.t_min, self.t_max
         )
         rigids_t, gt_rot_score, gt_trans_score, rot_scaling, trans_scaling = (
-            self._diffuse_per_batch(rigids_0, t_scalar)
+            self._diffuse_per_example(rigids_0, t_vec)
         )
-        # All returned shapes: rigids_t (B*F, L, 7), gt_rot/trans_score (B*F, L, 3),
-        # *_scaling (B*F,) (constant per-step at smoke-test fidelity).
+        # Shapes: rigids_t (B*F, L, 7), gt_rot/trans_score (B*F, L, 3),
+        # *_scaling (B*F,) -- now genuinely per-example.
 
         # ---- Step 7: assemble gt_feat for the loss ----
         gt_feat: Dict[str, Any] = {
@@ -286,17 +338,22 @@ class ConfRoverTrainable(ConfRover):
     # Diffusion helper
     # =========================================================================
 
-    def _diffuse_per_batch(
-        self, rigids_0_tensor: torch.Tensor, t_scalar: float
+    def _diffuse_per_example(
+        self, rigids_0_tensor: torch.Tensor, t_vec: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Apply ``diffuser.forward_marginal`` and compute ground-truth scores.
+        """Noise each frame at its own diffusion time and compute GT scores.
+
+        ``diffuser.forward_marginal`` takes a scalar ``t``, so we noise each of
+        the ``B*F`` frames in a short Python loop (``B*F`` is small -- a handful
+        to a few dozen -- and cheap relative to the model forward). Ground-truth
+        scores and score scalings are then assembled per example.
 
         Parameters
         ----------
         rigids_0_tensor:
             ``(B*F, L, 7)`` ground-truth rigids.
-        t_scalar:
-            Single diffusion time used for the whole batch.
+        t_vec:
+            ``(B*F,)`` per-example diffusion times.
 
         Returns
         -------
@@ -308,54 +365,52 @@ class ConfRoverTrainable(ConfRover):
         """
         diffuser = self.decoder.diffuser
         device = rigids_0_tensor.device
+        dtype = rigids_0_tensor.dtype
         BF, L, _ = rigids_0_tensor.shape
 
         rigids_0 = ru.Rigid.from_tensor_7(rigids_0_tensor)
 
-        # diffuser.forward_marginal expects num_frames so it can broadcast
-        # noise correctly. With BF flattened and num_frames=1 we noise each
-        # rigid independently (which is what we want for training).
-        marg = diffuser.forward_marginal(
-            rigids_0=rigids_0,
-            t=t_scalar,
-            num_frames=1,
-            as_tensor_7=True,
-        )
-        rigids_t = marg["rigids_t"]
-        if not isinstance(rigids_t, torch.Tensor):
-            rigids_t = torch.as_tensor(rigids_t)
-        rigids_t = rigids_t.to(device=device, dtype=rigids_0_tensor.dtype)
+        rigids_t_rows = []
+        rot_scalings = []
+        trans_scalings = []
+        for i in range(BF):
+            ti = float(t_vec[i].item())
+            marg = diffuser.forward_marginal(
+                rigids_0=rigids_0[i : i + 1],  # Rigid of batch shape (1, L)
+                t=ti,
+                num_frames=1,
+                as_tensor_7=True,
+            )
+            rt = marg["rigids_t"]
+            if not isinstance(rt, torch.Tensor):
+                rt = torch.as_tensor(rt)
+            rigids_t_rows.append(rt.to(device=device, dtype=dtype).reshape(1, L, 7))
+            # score_scaling equalizes gradient magnitude across t; returns a
+            # numpy scalar per (scalar) time.
+            rot_scalings.append(float(diffuser._so3_diffuser.score_scaling(ti)))
+            trans_scalings.append(float(diffuser._r3_diffuser.score_scaling(ti)))
+
+        rigids_t = torch.cat(rigids_t_rows, dim=0)  # (B*F, L, 7)
 
         # Ground-truth scores: same calculation the decoder does with predicted
-        # rigids_0, but using the GT rigids_0.
+        # rigids_0, but using the GT rigids_0. calc_* accept per-example t.
+        t_for_score = t_vec.to(device=device, dtype=dtype)
         rigids_t_obj = ru.Rigid.from_tensor_7(rigids_t)
-        t_tensor = torch.full(
-            (BF,), t_scalar, dtype=rigids_0_tensor.dtype, device=device
-        )
         gt_rot_score = diffuser.calc_rot_score(
             rigids_t_obj.get_rots(),
             rigids_0.get_rots(),
-            t_tensor,
+            t_for_score,
             use_cached_score=False,
         )
         gt_trans_score = diffuser.calc_trans_score(
             rigids_t_obj.get_trans(),
             rigids_0.get_trans(),
-            t_tensor[:, None, None],
+            t_for_score[:, None, None],
             use_torch=True,
         )
 
-        # Score scalings (used by the loss to equalize gradient magnitude
-        # across t). The diffuser returns numpy scalars; broadcast to (B*F,).
-        rot_scaling = float(diffuser._so3_diffuser.score_scaling(t_scalar))
-        trans_scaling = float(diffuser._r3_diffuser.score_scaling(t_scalar))
-        rot_scaling_t = torch.full(
-            (BF,), rot_scaling, dtype=rigids_0_tensor.dtype, device=device
-        )
-        trans_scaling_t = torch.full(
-            (BF,), trans_scaling, dtype=rigids_0_tensor.dtype, device=device
-        )
-
+        rot_scaling_t = torch.tensor(rot_scalings, dtype=dtype, device=device)
+        trans_scaling_t = torch.tensor(trans_scalings, dtype=dtype, device=device)
         return rigids_t, gt_rot_score, gt_trans_score, rot_scaling_t, trans_scaling_t
 
     # =========================================================================

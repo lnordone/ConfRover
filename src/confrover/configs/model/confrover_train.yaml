@@ -81,7 +81,7 @@ decoder:
       _target_: confrover.train.loss.LossWeights
       rot: 1.0
       trans: 1.0
-      bb_atom: 0.0       # TODO: set > 0 once you port loss_bb_atom
+      bb_atom: 0.25      # backbone-atom aux loss (active for t < t_bb_threshold)
       dist_mat: 0.0
       torsion: 0.0
       aux_atom14: 0.0

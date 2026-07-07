@@ -22,11 +22,13 @@ WORKING NOW:
       diffuser's per-time score scaling.
     * ``loss_trans``: translation score-matching MSE on R^3, weighted by the
       diffuser's per-time score scaling.
+    * ``loss_bb_atom``: backbone-atom (N, CA, C, O) MSE on ``pred_atom14``,
+      active only when ``t < t_bb_threshold`` (default 0.25). Enable by setting
+      ``decoder.loss.weights.bb_atom > 0`` (on by default in
+      ``confrover_train.yaml``).
 
 TODO (port from https://github.com/bytedance/ConfDiff -- look for ``loss.py``
 or ``losses.py`` in their model/decoder directory):
-    * ``loss_bb_atom``: backbone-atom (N, CA, C, O) MSE on ``pred_atom14``,
-      typically active only when ``t < t_bb_threshold`` (e.g. t < 0.25).
     * ``loss_dist_mat``: pairwise CA-CA distance MSE for local-geometry
       regularisation (helps small models converge).
     * ``loss_torsion``: chi-angle torsion loss (atan2-style, avoids 2pi
@@ -182,23 +184,33 @@ class SE3DiffusionLoss(nn.Module):
 
         loss = self.weights.rot * loss_rot + self.weights.trans * loss_trans
 
-        # ---- TODO: backbone-atom MSE (active only when t < t_bb_threshold) ----
-        # Reference: ConfDiff loss.py, search for "bb_atom" or "atom4".
-        # Sketch:
-        #   bb_idx = [0, 1, 2, 4]  # N, CA, C, O in atom14
-        #   active = (t < self.t_bb_threshold).float()  # (B*F,)
-        #   gt_bb = gt_feat["atom14_gt_positions"][..., bb_idx, :]
-        #   pred_bb = pred_atom14[..., bb_idx, :]
-        #   m = rigids_mask[..., None, None]
-        #   loss_bb = (((pred_bb - gt_bb) * m) ** 2).sum(dim=(-1, -2, -3)) / (
-        #       4 * rigids_mask.sum(dim=-1) + self.eps
-        #   )
-        #   loss_bb = (loss_bb * active).sum() / (active.sum() + self.eps)
-        #   loss = loss + self.weights.bb_atom * loss_bb
+        # ---- Backbone-atom MSE (active only when t < t_bb_threshold) ----
+        # Ported per ConfDiff's ``loss_bb_atom``. Supervises the predicted
+        # backbone atom positions directly (in addition to the score-matching
+        # terms) but only on near-clean frames, where ``pred_atom14`` is a
+        # meaningful reconstruction rather than pure noise.
+        #
+        # Atom indexing: in the OpenFold **atom14** layout the first four slots
+        # are always N, CA, C, O for every residue type (GLY has no CB but its
+        # backbone still occupies [0, 1, 2, 3]), so these indices are safe
+        # across residues. NOTE: the ``[0, 1, 2, 4]`` seen in older sketches is
+        # **atom37** ordering (O at 4) -- do not use it on atom14 tensors.
         if self.weights.bb_atom > 0:
-            raise NotImplementedError(
-                "loss_bb_atom not yet ported. See ConfDiff loss.py for reference."
-            )
+            bb_idx = [0, 1, 2, 3]  # N, CA, C, O in atom14
+            gt_atom14 = gt_feat["atom14_gt_positions"]
+            gt_bb = gt_atom14[..., bb_idx, :]  # (B*F, L, 4, 3)
+            pred_bb = pred_atom14[..., bb_idx, :]  # (B*F, L, 4, 3)
+            m = rigids_mask[..., None, None]  # (B*F, L, 1, 1)
+            # Per-example squared error over (residues, 4 backbone atoms, xyz),
+            # normalised by the number of supervised atoms in that example.
+            sq = ((pred_bb - gt_bb) * m).pow(2).sum(dim=(-1, -2, -3))  # (B*F,)
+            denom = len(bb_idx) * rigids_mask.sum(dim=-1) + self.eps  # (B*F,)
+            loss_bb_per = sq / denom  # (B*F,)
+            # Gate: only supervise low-noise (near-clean) frames.
+            active = (t < self.t_bb_threshold).to(loss_bb_per.dtype)  # (B*F,)
+            loss_bb = (loss_bb_per * active).sum() / (active.sum() + self.eps)
+            aux["loss_bb_atom"] = loss_bb.detach()
+            loss = loss + self.weights.bb_atom * loss_bb
 
         # ---- TODO: pairwise CA-CA distance loss ----
         # Reference: ConfDiff loss.py, "dist_mat" or "dgram".

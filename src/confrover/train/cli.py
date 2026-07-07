@@ -58,6 +58,20 @@ def compose_hydra_config(
 def train(cfg: DictConfig) -> Trainer:
     seed_everything(cfg.seed, workers=True)
 
+    # If --val_manifest was supplied, the CLI only set data.val_dataset.config;
+    # flesh it out into a full dataset block by mirroring train_dataset
+    # (deterministic, no shuffle) so validation actually runs.
+    val_ds = cfg.data.get("val_dataset")
+    if val_ds is not None and "_target_" not in val_ds:
+        val_block = OmegaConf.create(
+            OmegaConf.to_container(cfg.data.train_dataset, resolve=False)
+        )
+        val_block.config = val_ds.config
+        val_block.deterministic = True
+        val_block.shuffle = False
+        cfg.data.val_dataset = val_block
+        log.info("Enabled validation split (mirrored from train_dataset).")
+
     log.info(log_header(log, "Instantiate datamodule"))
     log.info(f"   _target_ = {cfg.data._target_}")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
@@ -65,6 +79,11 @@ def train(cfg: DictConfig) -> Trainer:
     log.info(log_header(log, "Instantiate model"))
     log.info(f"   _target_ = {cfg.model._target_}")
     model = hydra.utils.instantiate(cfg.model)
+
+    # Record the resolved model config so saved checkpoints embed a `model_cfg`
+    # and are loadable via ConfRover.from_pretrained / the inference CLI.
+    if hasattr(model, "set_model_cfg"):
+        model.set_model_cfg(OmegaConf.to_container(cfg.model, resolve=True))
 
     if cfg.get("from_pretrained_ckpt"):
         log.info(f"Loading initial weights from {cfg.from_pretrained_ckpt}")

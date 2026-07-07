@@ -21,16 +21,16 @@ The output dict aligns with the keys ``ConfRoverTrainable.training_step``
 consumes; see ``confrover.train.module``.
 
 WORKING NOW:
-    Loading XTC frames, OpenFold preprocessing (re-using
-    ``GenDataset.process_coords``), CA centering, padded collate.
+    * Loading XTC frames, OpenFold preprocessing (re-using
+      ``GenDataset.process_coords``), CA centering, padded collate.
+    * Real trajectory length via mdtraj (``_count_xtc_frames``), so random
+      window starts actually span the trajectory.
+    * Multi-replicate sampling (ATLAS proteins typically have 3 replicates):
+      set ``xtc_fpaths`` on a case; one replicate is drawn per ``__getitem__``.
+    * Random-stride sampling: set ``strides_in_10ps`` on the dataset config and
+      a feasible stride is drawn per window.
 
 TODO (left as exercises):
-    * Multi-replicate sampling (ATLAS proteins typically have 3 replicates,
-      each a separate ``.xtc``). The skeleton handles a single replicate per
-      case for simplicity.
-    * Random-stride sampling: paper trains with multiple strides; the skeleton
-      uses a fixed stride. Adding random stride is a one-line change in
-      ``__getitem__`` (sample stride from a list).
     * Length bucketing for efficient batching across heterogeneous proteins.
 """
 from __future__ import annotations
@@ -40,6 +40,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import mdtraj
 import numpy as np
 import torch
 from openfold.np import residue_constants as rc
@@ -54,6 +55,20 @@ from confrover.utils.torch.tensor import rearrange
 logger = get_pylogger(__name__)
 
 
+def _count_xtc_frames(xtc_path: str) -> int:
+    """Return the number of frames in an ``.xtc`` file without loading coords.
+
+    Uses mdtraj's frame-offset table (fast); falls back to a full read on the
+    rare mdtraj build that does not implement ``__len__`` on the file object.
+    """
+    with mdtraj.formats.XTCTrajectoryFile(xtc_path, "r") as f:
+        try:
+            return len(f)
+        except TypeError:
+            xyz, _, _, _ = f.read()
+            return int(xyz.shape[0])
+
+
 # =============================================================================
 # Manifest dataclasses
 # =============================================================================
@@ -61,13 +76,31 @@ logger = get_pylogger(__name__)
 
 @dataclass
 class TrajCaseConfig:
-    """One protein's trajectory configuration."""
+    """One protein's trajectory configuration.
+
+    Supports either a single replicate (``xtc_fpath``) or several ATLAS
+    replicates (``xtc_fpaths``, e.g. the three ``*_prod_R{1,2,3}_fit.xtc``
+    files). At least one of the two must be present in the manifest; both are
+    normalised to the ``xtc_fpaths`` list in :meth:`__post_init__`, and one
+    replicate is chosen per ``__getitem__`` (see :meth:`TrajDataset._pick_xtc_path`).
+    """
 
     case_id: str
     seqres: str
-    xtc_fpath: str
     pdb_fpath: str
-    n_total_frames: Optional[int] = None  # populated lazily on first load
+    xtc_fpath: Optional[str] = None
+    xtc_fpaths: Optional[List[str]] = None
+    n_total_frames: Optional[int] = None  # explicit override; else counted lazily
+
+    def __post_init__(self) -> None:
+        if self.xtc_fpaths is None:
+            if self.xtc_fpath is None:
+                raise ValueError(
+                    f"case {self.case_id!r}: provide 'xtc_fpath' or 'xtc_fpaths'."
+                )
+            self.xtc_fpaths = [self.xtc_fpath]
+        if self.xtc_fpath is None:
+            self.xtc_fpath = self.xtc_fpaths[0]
 
     @property
     def seqlen(self) -> int:
@@ -80,7 +113,10 @@ class TrajDatasetConfig:
 
     name: str
     n_frames: int  # window size (# frames per training example)
-    stride_in_10ps: int  # spacing between consecutive frames in a window
+    stride_in_10ps: int  # default spacing between frames in a window
+    # If set, a stride is sampled from this list per window (paper trains
+    # multi-stride). ``stride_in_10ps`` is used as the single-stride fallback.
+    strides_in_10ps: Optional[List[int]] = None
     cases: List[TrajCaseConfig] = field(default_factory=list)
     samples_per_epoch: Optional[int] = None  # if None, one window per case per epoch
     relpath_to: Optional[str] = None  # base path for resolving xtc/pdb paths
@@ -102,8 +138,9 @@ class TrajDatasetConfig:
         if relpath_to is not None:
             base = Path(relpath_to)
             for c in cfg.cases:
-                c.xtc_fpath = str(base / c.xtc_fpath)
                 c.pdb_fpath = str(base / c.pdb_fpath)
+                c.xtc_fpaths = [str(base / p) for p in c.xtc_fpaths]
+                c.xtc_fpath = c.xtc_fpaths[0]
         return cfg
 
 
@@ -142,6 +179,8 @@ class TrajDataset(torch.utils.data.Dataset):
         self.repr_loader = repr_loader
         self.deterministic = deterministic
         self.loader_cfg = LoaderConfig(**loader_kwargs)
+        # Per-XTC frame-count cache so we count each replicate at most once.
+        self._frame_count_cache: Dict[str, int] = {}
 
         # We re-use GenDataset.process_coords for OpenFold feature extraction;
         # rather than subclass GenDataset (which assumes inference-style
@@ -153,27 +192,52 @@ class TrajDataset(torch.utils.data.Dataset):
             return self.cfg.samples_per_epoch
         return len(self.cfg.cases)
 
-    # ---- Frame sampling -----------------------------------------------------
+    # ---- Frame / replicate / stride sampling --------------------------------
 
-    def _sample_window_indices(self, case: TrajCaseConfig) -> np.ndarray:
-        """Pick which frame indices in the source XTC to use for this window.
+    def _pick_xtc_path(self, case: TrajCaseConfig) -> str:
+        """Choose one replicate XTC for this window.
 
-        Frames are spaced ``cfg.stride_in_10ps`` 10-ps steps apart. The starting
-        offset is random unless ``self.deterministic`` is True.
+        Deterministic mode (and single-replicate cases) always uses the first
+        replicate so the smoke test is reproducible.
         """
-        if case.n_total_frames is None:
-            # Cheap one-time read of the trajectory length via mdtraj is fine
-            # because XTC is indexed; but to keep this template dependency-light
-            # we just trust the user-supplied value or fall back to a generous
-            # upper bound. Production code should populate n_total_frames
-            # eagerly (e.g. in TrajDatasetConfig.__post_init__) by calling
-            # mdtraj.iterload(...) and counting frames.
-            case.n_total_frames = 1000  # ATLAS trajectories are 10000 frames
+        paths = case.xtc_fpaths or [case.xtc_fpath]
+        if self.deterministic or len(paths) == 1:
+            return paths[0]
+        return paths[int(np.random.randint(0, len(paths)))]
 
+    def _n_total_frames(self, case: TrajCaseConfig, xtc_path: str) -> int:
+        """Number of frames in ``xtc_path`` (respecting an explicit override)."""
+        if case.n_total_frames is not None:
+            return case.n_total_frames
+        if xtc_path not in self._frame_count_cache:
+            self._frame_count_cache[xtc_path] = _count_xtc_frames(xtc_path)
+        return self._frame_count_cache[xtc_path]
+
+    def _choose_stride(self, n_total_frames: int) -> int:
+        """Pick a stride (10-ps units) that fits within the trajectory.
+
+        Draws from ``cfg.strides_in_10ps`` when provided, else uses the single
+        ``cfg.stride_in_10ps``. Strides too large for this trajectory are
+        filtered out; if none fit, the smallest candidate is used (window
+        sampling then clamps the start to 0).
+        """
+        candidates = self.cfg.strides_in_10ps or [self.cfg.stride_in_10ps]
         F = self.cfg.n_frames
-        stride = self.cfg.stride_in_10ps
-        max_start = case.n_total_frames - (F - 1) * stride - 1
-        max_start = max(max_start, 0)
+        feasible = [s for s in candidates if (F - 1) * s <= n_total_frames - 1]
+        if not feasible:
+            feasible = [min(candidates)]
+        if self.deterministic or len(feasible) == 1:
+            return feasible[0]
+        return int(feasible[int(np.random.randint(0, len(feasible)))])
+
+    def _sample_window_indices(self, n_total_frames: int, stride: int) -> np.ndarray:
+        """Pick ``n_frames`` frame indices spaced ``stride`` steps apart.
+
+        The starting offset is random unless ``self.deterministic`` is True.
+        """
+        F = self.cfg.n_frames
+        span = (F - 1) * stride
+        max_start = max(n_total_frames - span - 1, 0)
         if self.deterministic or max_start == 0:
             start = 0
         else:
@@ -196,13 +260,18 @@ class TrajDataset(torch.utils.data.Dataset):
         seqres = case.seqres
         seqlen = case.seqlen
         F = self.cfg.n_frames
-        frame_idxs = self._sample_window_indices(case)
+
+        # Choose replicate -> its frame count -> a feasible stride -> the window.
+        xtc_path = self._pick_xtc_path(case)
+        n_total = self._n_total_frames(case, xtc_path)
+        stride = self._choose_stride(n_total)
+        frame_idxs = self._sample_window_indices(n_total, stride)
 
         # ---- Load frames as atom37 ----
         per_frame_atom37 = []
         for fi in frame_idxs:
             atom37 = xtc_to_atom37(
-                xtc_path=case.xtc_fpath,
+                xtc_path=xtc_path,
                 pdb_path=case.pdb_fpath,
                 seqlen=seqlen,
                 frame_idx=int(fi),

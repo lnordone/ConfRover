@@ -30,6 +30,8 @@ from confrover.data.pretrain_repr.openfold.make_openfold_repr import (
 )
 from confrover.inference import add_args as _add_generate_args
 from confrover.inference import cli as _generate_cli
+from confrover.train.eval.__main__ import add_args as _add_eval_args
+from confrover.train.eval.__main__ import cli as _eval_cli
 from confrover.utils import get_pylogger
 
 log = get_pylogger(__name__)
@@ -79,6 +81,15 @@ def build_parser():
     )
     generate_parser = _add_generate_args(generate_parser)
     generate_parser.set_defaults(func=_generate_cli)
+
+    # Evaluate generated ensembles against ATLAS reference data
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Quantitative ATLAS metrics for generated ensembles.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    eval_parser = _add_eval_args(eval_parser)
+    eval_parser.set_defaults(func=_eval_cli)
 
     return main_parser
 

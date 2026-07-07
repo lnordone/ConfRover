@@ -2,16 +2,17 @@
 
 The upstream ByteDance ConfRover release is **inference-only**. This subpackage adds the training plumbing the paper describes but does not ship.
 
-This is a **scaffolded template**. The wiring is correct end-to-end; the loss function intentionally implements only the rotation + translation score-matching terms so that you have a runnable smoke-test starting point. Auxiliary loss components and other paper-faithful details are left as TODOs that you will fill in by reading the predecessor [ConfDiff](https://github.com/bytedance/ConfDiff) repo.
+This started as a scaffolded template and is being built out into a runnable small-scale training pipeline. The wiring is correct end-to-end; the loss now implements rot + trans score-matching **plus** the backbone-atom auxiliary. The remaining auxiliary loss components are left as TODOs to port from the predecessor [ConfDiff](https://github.com/bytedance/ConfDiff) repo.
 
 ## What's in here
 
 | File | Status | Purpose |
 | --- | --- | --- |
-| `loss.py` | **Working minimum** | `SE3DiffusionLoss` — implements rot+trans score-matching MSE. Auxiliary terms (`bb_atom`, `dist_mat`, `torsion`, `aux_atom14`) are TODO — port from ConfDiff `loss.py`. |
-| `dataset.py` | **Working** | `TrajDataset` — loads ATLAS XTC trajectories, samples F-frame windows, runs OpenFold preprocessing on every frame, batches with padding. |
-| `module.py` | **Working** | `ConfRoverTrainable` — adds `training_step`, `validation_step`, `configure_optimizers` to the upstream LightningModule. Implements teacher-forced encoding + causal LLaMA pass + per-frame diffusion noising + a single batched decoder forward. |
-| `cli.py` | **Working** | `python -m confrover.train.cli` entrypoint. Composes Hydra configs, instantiates Trainer, calls `.fit`. |
+| `loss.py` | **Working** | `SE3DiffusionLoss` — rot+trans score-matching MSE **and** `loss_bb_atom` (backbone N,CA,C,O MSE, gated on `t < t_bb_threshold`). Remaining aux terms (`dist_mat`, `torsion`, `aux_atom14`) are TODO — port from ConfDiff `loss.py`. |
+| `dataset.py` | **Working** | `TrajDataset` — loads ATLAS XTC trajectories, samples F-frame windows (real frame count via mdtraj, multi-replicate + random-stride sampling), runs OpenFold preprocessing on every frame, batches with padding. |
+| `module.py` | **Working** | `ConfRoverTrainable` — adds `training_step`, `validation_step`, `configure_optimizers`, and `on_save_checkpoint` (embeds `model_cfg` for `from_pretrained`). Teacher-forced encoding + causal LLaMA pass + **per-example** diffusion noising + a single batched decoder forward. |
+| `cli.py` | **Working** | `python -m confrover.train.cli` entrypoint. Composes Hydra configs, instantiates Trainer, calls `.fit`. Pass `--val_manifest` to enable a validation split. |
+| `eval/metrics.py` | **Working** | Quantitative ATLAS metrics (RMSF, CA-RMSD/TM-score, Rg, contact maps) comparing generated vs. reference trajectories. Run via `python -m confrover.train.eval`. |
 
 Configs:
 - `src/confrover/configs/train.yaml` — top-level Hydra training config.
@@ -20,8 +21,13 @@ Configs:
 Examples / scripts:
 - `examples/train_manifest_smoke.json` — single-protein single-window manifest using the bundled `7jfl_C` test data.
 - `examples/overfit_smoke.ipynb` — the actual overfit-one-batch smoke test (run this first).
+- `examples/pace_01_component_checks.ipynb` — validate the new training code (loss, dataset, checkpoint, metrics) on bundled data, offline, on a PACE GPU node.
+- `examples/pace_02_train_and_eval.ipynb` — mini end-to-end run (train → generate → eval) on the 4 bundled proteins, offline.
 - `scripts/phoenix_interactive.sh` — `salloc` helper for a Phoenix interactive GPU session.
 - `scripts/phoenix_train.sbatch` — SLURM batch template for a longer training run.
+- `scripts/build_manifests.py` — build train + eval manifests from an ATLAS dir + a `chain_name,seqres` CSV.
+
+**Full step-by-step for a small-scale run (data prep → train → generate → eval): see [`RUNBOOK.md`](RUNBOOK.md).**
 
 ## How to use it
 
@@ -58,25 +64,24 @@ Same flow, but with the full ATLAS train split and probably multi-GPU DDP. Edit 
 
 ## Porting roadmap (read this before changing anything)
 
-The smoke-test loss is intentionally minimal (rot + trans score-matching only). To get loss curves that look like the paper's, port these components from the [ConfDiff](https://github.com/bytedance/ConfDiff) repo (same authors, same per-frame denoiser):
+Already done in this fork (were TODOs in the original scaffold):
 
-1. **Backbone-atom loss (`loss_bb_atom`)**. Find ConfDiff's loss file (typically `model/decoder/.../loss.py`); the function name will contain `bb_atom` or `atom4`. It's an MSE on the (N, CA, C, O) atoms of `pred_atom14`, gated by `t < t_bb_threshold`. Set `decoder.loss.weights.bb_atom > 0` in the model config; the placeholder in `loss.py` raises `NotImplementedError` until you implement the body.
-2. **Pairwise CA-CA distance loss (`loss_dist_mat`)**. Helps small models learn local geometry. Same place in ConfDiff.
-3. **Torsion loss (`loss_torsion`)**. Use atan2-style loss on (sin, cos) pairs to handle 2π wrap. OpenFold's `supervised_chi_loss` is a good reference.
-4. **Full atom14 auxiliary (`loss_aux_atom14`)**. Late-training-only, fine-tunes side chains.
+- **Backbone-atom loss (`loss_bb_atom`)** — implemented in `loss.py`: MSE on the (N, CA, C, O) atoms of `pred_atom14` (atom14 indices `[0,1,2,3]`), gated by `t < t_bb_threshold`. Enabled by default via `decoder.loss.weights.bb_atom` in `confrover_train.yaml`.
+- **Per-example `t` sampling** — `ConfRoverTrainable._diffuse_per_example` samples one `t` per frame and noises each independently.
+- **Random-stride + multi-replicate sampling** — set `strides_in_10ps` on the dataset config and `xtc_fpaths` on a case; `TrajDataset` draws a feasible stride and a replicate per window. Real trajectory length comes from `_count_xtc_frames`.
+- **Checkpoint format compatibility** — `ConfRoverTrainable.on_save_checkpoint` embeds an inference-shaped `model_cfg`, so checkpoints load via `ConfRover.from_pretrained` / the inference CLI.
 
-Other things you should expect to revisit:
+Still to port from the [ConfDiff](https://github.com/bytedance/ConfDiff) repo (same authors, same per-frame denoiser) if you want paper-faithful curves:
 
-- **Per-example `t` sampling**. The smoke-test version samples one scalar `t` per training step (acceptable for overfitting, but reduces gradient diversity for full training). Modify `ConfRoverTrainable._diffuse_per_batch` to sample `t` per example and call `forward_marginal` per example (or vectorize). ConfDiff's training loop is the reference.
-- **Trajectory-window sampling strategy**. `TrajDataset._sample_window_indices` uses a fixed stride. Paper trains with multiple strides — extend to sample stride from a list (e.g. `[60, 120, 256, 512]` 10-ps).
-- **Multi-replicate handling**. Each ATLAS protein has 3 replicates (`*_prod_R{1,2,3}_fit.xtc`). The current dataset only uses one replicate per case; extend `TrajCaseConfig` to carry a list of XTC paths and pick one at random per `__getitem__`.
-- **EMA of model weights**. Standard for diffusion training. Add via `lightning.pytorch.callbacks` or hand-roll inside `ConfRoverTrainable`.
-- **Checkpoint format compatibility**. After training, save checkpoints as `{"model_cfg": ..., "state_dict": ...}` so they're loadable via the upstream `ConfRover.from_pretrained`. The Lightning `ModelCheckpoint` callback alone doesn't do this — write a small `on_save_checkpoint` hook on `ConfRoverTrainable` to inject `model_cfg`.
+1. **Pairwise CA-CA distance loss (`loss_dist_mat`)**. Helps small models learn local geometry.
+2. **Torsion loss (`loss_torsion`)**. Use atan2-style loss on (sin, cos) pairs to handle 2π wrap. OpenFold's `supervised_chi_loss` is a good reference.
+3. **Full atom14 auxiliary (`loss_aux_atom14`)**. Late-training-only, fine-tunes side chains.
+4. **EMA of model weights**. Standard for diffusion training. Add via `lightning.pytorch.callbacks` or hand-roll inside `ConfRoverTrainable`.
 
 ## Common failure modes (and what to do)
 
 - **`AssertionError: decoder.loss is None`** — your model config didn't include the `decoder.loss` block. Use `confrover_train.yaml`, not `confrover.yaml`.
-- **`forward_marginal` returns NumPy / device mismatch** — the SE3 diffuser mixes torch and numpy internally. The fix in `_diffuse_per_batch` casts back; if you see it on a different code path, do the same `torch.as_tensor(..., device=...).to(dtype)` dance.
+- **`forward_marginal` returns NumPy / device mismatch** — the SE3 diffuser mixes torch and numpy internally. The fix in `_diffuse_per_example` casts back; if you see it on a different code path, do the same `torch.as_tensor(..., device=...).to(dtype)` dance.
 - **Loss is exactly constant across steps** — gradients aren't reaching the decoder. Most common cause: `freeze_model_nn=true` (default in `confrover.yaml`). The training config sets it to `false`.
 - **Loss → NaN at step 1** — almost always a missing/zero score-scaling. Check that `gt_feat["rot_score_scaling"]` and `gt_feat["trans_score_scaling"]` are positive scalars before the loss runs.
 - **Memory blow-up on a single 50-residue protein** — the encoder produces a `(B*F, L, L, C)` pair tensor; with `F=4 L=50 C=128` that's only 1.3 MB, but with `L=200` it's 80 MB *per training example* and the LLaMA pass inflates it further. Drop `n_frames` first, then `L`.
